@@ -1,0 +1,325 @@
+name: 🔄 Full Stack Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      deployment_type:
+        description: 'Deployment Type'
+        required: true
+        default: 'full-stack'
+        type: choice
+        options:
+        - full-stack
+        - infrastructure-only
+        - application-only
+      environment:
+        description: 'Target Environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+        - staging
+        - production
+      destroy_after:
+        description: 'Auto-destroy after (hours)'
+        required: false
+        default: '0'
+        type: choice
+        options:
+        - '0'
+        - '1'
+        - '2'
+        - '6'
+        - '12'
+        - '24'
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  deploy-infrastructure:
+    name: 🏗️ Deploy Infrastructure
+    runs-on: ubuntu-latest
+    if: |
+      github.event.inputs.deployment_type == 'full-stack' || 
+      github.event.inputs.deployment_type == 'infrastructure-only'
+    outputs:
+      cluster-name: ${{ steps.cluster-info.outputs.cluster-name }}
+      cluster-endpoint: ${{ steps.cluster-info.outputs.cluster-endpoint }}
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔧 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 🏗️ Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.7
+
+      - name: 🚀 Terraform Init
+        working-directory: terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=laravel-terraform-state-${{ github.repository_owner }}" \
+            -backend-config="key=${{ github.event.inputs.environment }}/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: 📊 Terraform Plan
+        working-directory: terraform
+        run: |
+          terraform plan \
+            -var-file="terraform.tfvars" \
+            -var="environment=${{ github.event.inputs.environment }}" \
+            -out=tfplan
+
+      - name: ✅ Terraform Apply
+        working-directory: terraform
+        run: terraform apply -auto-approve tfplan
+
+      - name: 📋 Get Cluster Info
+        id: cluster-info
+        run: |
+          CLUSTER_NAME=$(aws eks list-clusters --region ${{ env.AWS_REGION }} --query 'clusters[0]' --output text)
+          CLUSTER_ENDPOINT=$(aws eks describe-cluster --name $CLUSTER_NAME --region ${{ env.AWS_REGION }} --query 'cluster.endpoint' --output text)
+          echo "cluster-name=$CLUSTER_NAME" >> $GITHUB_OUTPUT
+          echo "cluster-endpoint=$CLUSTER_ENDPOINT" >> $GITHUB_OUTPUT
+
+  wait-for-infrastructure:
+    name: ⏳ Wait for Infrastructure
+    runs-on: ubuntu-latest
+    needs: deploy-infrastructure
+    outputs:
+      cluster-ready: ${{ steps.check.outputs.ready }}
+    
+    steps:
+      - name: 🔧 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: ⏳ Wait for EKS Cluster
+        id: check
+        run: |
+          echo "Waiting for EKS cluster to be fully ready..."
+          
+          for i in {1..20}; do
+            CLUSTER_STATUS=$(aws eks describe-cluster --name laravel-cluster --region ${{ env.AWS_REGION }} --query 'cluster.status' --output text 2>/dev/null || echo "NOTFOUND")
+            
+            if [ "$CLUSTER_STATUS" == "ACTIVE" ]; then
+              echo "✅ Cluster is active, checking nodes..."
+              
+              # Configure kubectl
+              aws eks update-kubeconfig --name laravel-cluster --region ${{ env.AWS_REGION }}
+              
+              # Wait for nodes to be ready
+              kubectl wait --for=condition=Ready nodes --all --timeout=300s
+              
+              if [ $? -eq 0 ]; then
+                echo "✅ All nodes are ready!"
+                echo "ready=true" >> $GITHUB_OUTPUT
+                exit 0
+              fi
+            fi
+            
+            echo "⏳ Cluster status: $CLUSTER_STATUS, waiting... (attempt $i/20)"
+            sleep 30
+          done
+          
+          echo "❌ Cluster not ready after 10 minutes"
+          echo "ready=false" >> $GITHUB_OUTPUT
+          exit 1
+
+  deploy-application:
+    name: 🚀 Deploy Application
+    runs-on: ubuntu-latest
+    needs: [deploy-infrastructure, wait-for-infrastructure]
+    if: |
+      always() &&
+      (github.event.inputs.deployment_type == 'full-stack' || 
+       github.event.inputs.deployment_type == 'application-only') &&
+      (needs.wait-for-infrastructure.outputs.cluster-ready == 'true' || 
+       github.event.inputs.deployment_type == 'application-only')
+    outputs:
+      image-tag: ${{ steps.build.outputs.image-tag }}
+      load-balancer: ${{ steps.get-lb.outputs.load-balancer }}
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔧 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 🔑 Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: 🏷️ Generate Image Tag
+        id: build
+        run: |
+          IMAGE_TAG=${{ github.sha }}
+          IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/laravel-k8s:$IMAGE_TAG
+          echo "image-tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "image-uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+
+      - name: 🐳 Build and Push Image
+        run: |
+          cd app
+          docker build -f Dockerfile.k8s -t ${{ steps.build.outputs.image-uri }} .
+          docker push ${{ steps.build.outputs.image-uri }}
+
+      - name: ⚙️ Setup kubectl and Helm
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+          
+          curl https://get.helm.sh/helm-v3.13.0-linux-amd64.tar.gz | tar xz
+          sudo mv linux-amd64/helm /usr/local/bin/
+
+      - name: 🔗 Configure Kubernetes Access
+        run: |
+          CLUSTER_NAME=$(aws eks list-clusters --region ${{ env.AWS_REGION }} --query 'clusters[0]' --output text)
+          aws eks update-kubeconfig --name $CLUSTER_NAME --region ${{ env.AWS_REGION }}
+
+      - name: 🚀 Deploy with Helm
+        run: |
+          NAMESPACE="laravel"
+          if [ "${{ github.event.inputs.environment }}" == "staging" ]; then
+            NAMESPACE="laravel-staging"
+          fi
+          
+          helm upgrade --install laravel-app ./helm/laravel-app \
+            --namespace $NAMESPACE \
+            --create-namespace \
+            --set image.tag=${{ steps.build.outputs.image-tag }} \
+            --set environment=${{ github.event.inputs.environment }} \
+            --wait
+
+      - name: 🔗 Get Load Balancer URL
+        id: get-lb
+        run: |
+          NAMESPACE="laravel"
+          if [ "${{ github.event.inputs.environment }}" == "staging" ]; then
+            NAMESPACE="laravel-staging"
+          fi
+          
+          sleep 60
+          LB_HOSTNAME=$(kubectl get svc laravel-service -n $NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          echo "load-balancer=$LB_HOSTNAME" >> $GITHUB_OUTPUT
+
+  integration-tests:
+    name: 🧪 Integration Tests
+    runs-on: ubuntu-latest
+    needs: deploy-application
+    if: success()
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔧 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 🏥 Health Check Tests
+        run: |
+          LB_URL="${{ needs.deploy-application.outputs.load-balancer }}"
+          echo "Testing: http://$LB_URL/health"
+          
+          # Wait for DNS propagation
+          sleep 120
+          
+          # Health check with retries
+          for i in {1..10}; do
+            if curl -f "http://$LB_URL/health"; then
+              echo "✅ Health check passed"
+              break
+            else
+              echo "⏳ Health check failed, attempt $i/10"
+              sleep 30
+            fi
+            
+            if [ $i -eq 10 ]; then
+              echo "❌ Health check failed after 10 attempts"
+              exit 1
+            fi
+          done
+
+  setup-auto-destroy:
+    name: ⏰ Setup Auto-Destroy
+    runs-on: ubuntu-latest
+    needs: [deploy-application, integration-tests]
+    if: |
+      success() && 
+      github.event.inputs.destroy_after != '0'
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: ⏰ Schedule Destruction
+        run: |
+          DESTROY_TIME=$(date -d "+${{ github.event.inputs.destroy_after }} hours" -u +"%Y-%m-%dT%H:%M:%SZ")
+          echo "Infrastructure will be destroyed at: $DESTROY_TIME"
+          
+          # Create a workflow dispatch event for destruction
+          curl -X POST \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/infrastructure.yml/dispatches \
+            -d "{\"ref\":\"main\",\"inputs\":{\"action\":\"destroy\",\"environment\":\"${{ github.event.inputs.environment }}\"}}" \
+            --header "X-GitHub-Api-Version: 2022-11-28"
+
+  deployment-summary:
+    name: 📊 Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [deploy-infrastructure, deploy-application, integration-tests]
+    if: always()
+    
+    steps:
+      - name: 📊 Generate Summary
+        run: |
+          echo "# 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment**: ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployment Type**: ${{ github.event.inputs.deployment_type }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Timestamp**: $(date -u)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "## 📋 Job Status" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Infrastructure | ${{ needs.deploy-infrastructure.result || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Application | ${{ needs.deploy-application.result || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Integration Tests | ${{ needs.integration-tests.result || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.integration-tests.result }}" == "success" ]; then
+            echo "## ✅ Deployment Successful!" >> $GITHUB_STEP_SUMMARY
+            echo "Your application is now running and accessible." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## ❌ Deployment Issues" >> $GITHUB_STEP_SUMMARY
+            echo "Please check the job logs for more details." >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ github.event.inputs.destroy_after }}" != "0" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "⏰ **Auto-destroy scheduled in ${{ github.event.inputs.destroy_after }} hours**" >> $GITHUB_STEP_SUMMARY
+          fi

@@ -1,0 +1,43 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "laravel-app.fullname" . }}-config
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "laravel-app.labels" . | nindent 4 }}
+data:
+  www.conf: |
+    [www]
+    user = www-data
+    group = www-data
+    listen = 127.0.0.1:9000
+    listen.owner = www-data
+    listen.group = www-data
+    
+    ; PHP-FPM Pool Configuration (optimized for Kubernetes)
+    pm = {{ .Values.phpfpm.config.pm }}
+    pm.max_children = {{ .Values.phpfpm.config.pm_max_children }}
+    pm.start_servers = {{ .Values.phpfpm.config.pm_start_servers }}
+    pm.min_spare_servers = {{ .Values.phpfpm.config.pm_min_spare_servers }}
+    pm.max_spare_servers = {{ .Values.phpfpm.config.pm_max_spare_servers }}
+    pm.max_requests = {{ .Values.phpfpm.config.pm_max_requests }}
+    
+    ; Health checks and monitoring
+    pm.status_path = /status
+    ping.path = /ping
+    ping.response = pong
+    
+    ; Security and performance
+    request_terminate_timeout = 30s
+    request_slowlog_timeout = 10s
+    slowlog = /proc/self/fd/2
+    
+    ; Logging
+    access.log = /proc/self/fd/2
+    clear_env = no
+    
+    ; Environment variables for Laravel
+    env[APP_ENV] = $APP_ENV
+    env[APP_VERSION] = $APP_VERSION
+    env[KUBERNETES_NAMESPACE] = $KUBERNETES_NAMESPACE
+    env[KUBERNETES_POD_NAME] = $KUBERNETES_POD_NAME

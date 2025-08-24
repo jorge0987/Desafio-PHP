@@ -1,0 +1,99 @@
+# ==========================================
+# Docker Compose - Desenvolvimento Local
+# ==========================================
+
+version: '3.8'
+
+services:
+  # ==========================================
+  # Laravel Application (PHP-FPM + Nginx)
+  # ==========================================
+  app:
+    build:
+      context: ./
+      dockerfile: Dockerfile.fpm
+      args:
+        UID: 1001
+        GID: 1001
+    container_name: laravel-app
+    restart: unless-stopped
+    working_dir: /var/www/html
+    ports:
+      - "8080:80"
+    volumes:
+      # Sincroniza o código-fonte para desenvolvimento em tempo real
+      # O que está no container é sobrescrito, exceto o vendor
+      - ./src:/var/www/html
+      - /var/www/html/vendor
+    environment:
+      # Carrega variáveis do arquivo .env para o container
+      - .env
+    env_file:
+      - ./src/.env.example # Use .env se já existir
+    networks:
+      - laravel-network
+
+  # ==========================================
+  # Laravel Application (Swoole/Octane)
+  # ==========================================
+  app-swoole:
+    build:
+      context: ./
+      dockerfile: Dockerfile.swoole
+      args:
+        UID: 1001
+        GID: 1001
+    container_name: laravel-app-swoole
+    restart: unless-stopped
+    working_dir: /var/www/html
+    ports:
+      - "8081:8000" # Expondo em uma porta diferente para não conflitar com FPM
+    volumes:
+      - ./src:/var/www/html
+      - /var/www/html/vendor
+    environment:
+      - .env
+    env_file:
+      - ./src/.env.example # Use .env se já existir
+    networks:
+      - laravel-network
+
+  # ==========================================
+  # Prometheus - Monitoring (Simplified)
+  # ==========================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: laravel-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--web.enable-lifecycle'
+    networks:
+      - laravel-network
+
+  # ==========================================
+  # Grafana - Dashboards
+  # ==========================================
+  grafana:
+    image: grafana/grafana:latest
+    container_name: laravel-grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - laravel-network
+
+# ==========================================
+# Networks
+# ==========================================
+networks:
+  laravel-network:
+    driver: bridge

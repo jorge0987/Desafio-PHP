@@ -1,0 +1,24 @@
+# ==========================================
+# Prometheus Configuration - Simple
+# ==========================================
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  # - "first_rules.yml"
+  # - "second_rules.yml"
+
+scrape_configs:
+  # Laravel Application
+  - job_name: 'laravel-app'
+    scrape_interval: 5s
+    static_configs:
+      - targets: ['app:80']
+    metrics_path: '/metrics'
+    
+  # Prometheus itself
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']

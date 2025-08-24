@@ -1,0 +1,456 @@
+name: 🚀 Application CI/CD
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target Environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+        - staging
+        - production
+      action:
+        description: 'Deployment Action'
+        required: true
+        default: 'deploy'
+        type: choice
+        options:
+        - deploy
+        - rollback
+        - status
+  
+  push:
+    branches:
+      - main
+    paths:
+      - 'app/**'
+      - 'helm/**'
+      - '.github/workflows/application.yml'
+
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'app/**'
+      - 'helm/**'
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: laravel-k8s
+  HELM_CHART_PATH: ./helm/laravel-app
+
+jobs:
+  code-quality:
+    name: 🔍 Code Quality & Security
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🐘 Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: mbstring, xml, ctype, iconv, intl, pdo_sqlite
+          coverage: xdebug
+
+      - name: 📦 Cache Composer Dependencies
+        uses: actions/cache@v4
+        with:
+          path: app/vendor
+          key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
+          restore-keys: ${{ runner.os }}-composer-
+
+      - name: 🔧 Install Dependencies
+        working-directory: app
+        run: |
+          composer install --prefer-dist --no-progress --optimize-autoloader
+          composer require --dev phpunit/phpunit phpstan/phpstan squizlabs/php_codesniffer
+
+      - name: 📋 PHP CodeSniffer
+        working-directory: app
+        run: vendor/bin/phpcs --standard=PSR12 src/ || true
+
+      - name: 🔍 PHPStan Analysis
+        working-directory: app
+        run: vendor/bin/phpstan analyse src/ --level=5 || true
+
+      - name: 🧪 Run Tests
+        working-directory: app
+        run: vendor/bin/phpunit tests/ --coverage-text || true
+
+  build-and-scan:
+    name: 🐳 Build & Security Scan
+    runs-on: ubuntu-latest
+    needs: code-quality
+    if: always() && (github.event_name == 'push' || github.event.inputs.action == 'deploy')
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔧 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 🔑 Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: 🏷️ Extract Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: 🔧 Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 🐳 Build and Push Image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: ./app
+          file: ./app/Dockerfile.k8s
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/arm64
+
+      - name: 🛡️ Run Trivy Security Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: 📤 Upload Trivy Scan Results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: 🔍 Check for Critical Vulnerabilities
+        run: |
+          CRITICAL=$(docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy image --severity CRITICAL --format json \
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }} | jq '.Results[].Vulnerabilities | length')
+          
+          if [ "$CRITICAL" -gt 0 ]; then
+            echo "❌ Critical vulnerabilities found: $CRITICAL"
+            echo "Please fix critical vulnerabilities before deployment"
+            exit 1
+          else
+            echo "✅ No critical vulnerabilities found"
+          fi
+
+  deploy-staging:
+    name: 🚀 Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build-and-scan
+    if: |
+      always() && 
+      (github.event_name == 'push' || github.event.inputs.action == 'deploy') &&
+      (github.event.inputs.environment == 'staging' || github.event.inputs.environment == '' || github.event_name == 'push')
+    environment:
+      name: staging
+      url: http://${{ steps.get-lb.outputs.load-balancer }}/health
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔧 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: ⚙️ Setup kubectl and Helm
+        run: |
+          # Install kubectl
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+          
+          # Install Helm
+          curl https://get.helm.sh/helm-v3.13.0-linux-amd64.tar.gz | tar xz
+          sudo mv linux-amd64/helm /usr/local/bin/
+
+      - name: 🔗 Configure Kubernetes Access
+        run: |
+          # Get cluster name (assumes single cluster or staging cluster)
+          CLUSTER_NAME=$(aws eks list-clusters --region ${{ env.AWS_REGION }} --query 'clusters[0]' --output text)
+          echo "Using cluster: $CLUSTER_NAME"
+          
+          aws eks update-kubeconfig \
+            --name $CLUSTER_NAME \
+            --region ${{ env.AWS_REGION }}
+          
+          # Verify connection
+          kubectl get nodes
+
+      - name: 📊 Helm Lint and Validate
+        run: |
+          helm lint ${{ env.HELM_CHART_PATH }}
+          helm template laravel-staging ${{ env.HELM_CHART_PATH }} \
+            --set image.tag=${{ github.sha }} \
+            --set environment=staging \
+            --dry-run --debug
+
+      - name: 🚀 Deploy Application
+        run: |
+          helm upgrade --install laravel-staging ${{ env.HELM_CHART_PATH }} \
+            --namespace laravel-staging \
+            --create-namespace \
+            --set image.tag=${{ github.sha }} \
+            --set environment=staging \
+            --set replicaCount=2 \
+            --wait \
+            --timeout=10m
+
+      - name: ✅ Verify Deployment
+        run: |
+          kubectl get pods -n laravel-staging
+          kubectl rollout status deployment/laravel-deployment -n laravel-staging --timeout=300s
+
+      - name: 🔗 Get Load Balancer URL
+        id: get-lb
+        run: |
+          # Wait for load balancer to be ready
+          sleep 60
+          
+          LB_HOSTNAME=$(kubectl get svc laravel-service -n laravel-staging -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          echo "load-balancer=$LB_HOSTNAME" >> $GITHUB_OUTPUT
+          echo "Load Balancer: $LB_HOSTNAME"
+
+      - name: 🏥 Health Check
+        run: |
+          LB_URL="${{ steps.get-lb.outputs.load-balancer }}"
+          
+          # Wait for load balancer DNS propagation
+          echo "Waiting for load balancer to be ready..."
+          sleep 120
+          
+          # Health check with retries
+          for i in {1..10}; do
+            if curl -f "http://$LB_URL/health"; then
+              echo "✅ Health check passed on attempt $i"
+              break
+            else
+              echo "⏳ Health check failed on attempt $i, retrying in 30s..."
+              sleep 30
+            fi
+            
+            if [ $i -eq 10 ]; then
+              echo "❌ Health check failed after 10 attempts"
+              kubectl logs -l app=laravel -n laravel-staging --tail=50
+              exit 1
+            fi
+          done
+
+  deploy-production:
+    name: 🎯 Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build-and-scan, deploy-staging]
+    if: |
+      always() &&
+      github.event.inputs.action == 'deploy' &&
+      github.event.inputs.environment == 'production' &&
+      needs.deploy-staging.result == 'success'
+    environment:
+      name: production
+      url: http://${{ steps.get-lb.outputs.load-balancer }}/health
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔧 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: ⚙️ Setup kubectl and Helm
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+          
+          curl https://get.helm.sh/helm-v3.13.0-linux-amd64.tar.gz | tar xz
+          sudo mv linux-amd64/helm /usr/local/bin/
+
+      - name: 🔗 Configure Kubernetes Access
+        run: |
+          CLUSTER_NAME=$(aws eks list-clusters --region ${{ env.AWS_REGION }} --query 'clusters[0]' --output text)
+          aws eks update-kubeconfig --name $CLUSTER_NAME --region ${{ env.AWS_REGION }}
+
+      - name: 🐤 Canary Deployment (10%)
+        run: |
+          # Deploy canary version
+          helm upgrade --install laravel-canary ${{ env.HELM_CHART_PATH }} \
+            --namespace laravel \
+            --create-namespace \
+            --set image.tag=${{ github.sha }} \
+            --set environment=production \
+            --set replicaCount=1 \
+            --set service.name=laravel-canary \
+            --wait
+
+      - name: 📊 Monitor Canary
+        run: |
+          echo "🐤 Monitoring canary deployment for 5 minutes..."
+          sleep 300
+          
+          # Check pod health
+          kubectl get pods -l app=laravel-canary -n laravel
+          
+          # Check logs for errors
+          ERROR_COUNT=$(kubectl logs -l app=laravel-canary -n laravel --since=5m | grep -i error | wc -l)
+          
+          if [ $ERROR_COUNT -gt 5 ]; then
+            echo "❌ Too many errors in canary: $ERROR_COUNT"
+            helm uninstall laravel-canary -n laravel
+            exit 1
+          fi
+          
+          echo "✅ Canary deployment healthy, proceeding with full deployment"
+
+      - name: 🚀 Full Production Deployment
+        run: |
+          helm upgrade --install laravel-app ${{ env.HELM_CHART_PATH }} \
+            --namespace laravel \
+            --set image.tag=${{ github.sha }} \
+            --set environment=production \
+            --set replicaCount=3 \
+            --wait
+          
+          # Cleanup canary
+          helm uninstall laravel-canary -n laravel || true
+
+      - name: 🔗 Get Production URL
+        id: get-lb
+        run: |
+          sleep 60
+          LB_HOSTNAME=$(kubectl get svc laravel-service -n laravel -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          echo "load-balancer=$LB_HOSTNAME" >> $GITHUB_OUTPUT
+
+      - name: 🏥 Production Health Check
+        run: |
+          LB_URL="${{ steps.get-lb.outputs.load-balancer }}"
+          sleep 120
+          
+          for i in {1..5}; do
+            if curl -f "http://$LB_URL/health"; then
+              echo "✅ Production deployment successful!"
+              break
+            else
+              sleep 30
+            fi
+          done
+
+  rollback:
+    name: ↩️ Rollback Application
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action == 'rollback'
+    environment:
+      name: ${{ github.event.inputs.environment }}-rollback
+    
+    steps:
+      - name: 🔧 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: ⚙️ Setup kubectl and Helm
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+          
+          curl https://get.helm.sh/helm-v3.13.0-linux-amd64.tar.gz | tar xz
+          sudo mv linux-amd64/helm /usr/local/bin/
+
+      - name: 🔗 Configure Kubernetes Access
+        run: |
+          CLUSTER_NAME=$(aws eks list-clusters --region ${{ env.AWS_REGION }} --query 'clusters[0]' --output text)
+          aws eks update-kubeconfig --name $CLUSTER_NAME --region ${{ env.AWS_REGION }}
+
+      - name: ↩️ Perform Rollback
+        run: |
+          NAMESPACE="laravel"
+          if [ "${{ github.event.inputs.environment }}" == "staging" ]; then
+            NAMESPACE="laravel-staging"
+          fi
+          
+          echo "Rolling back in namespace: $NAMESPACE"
+          helm rollback laravel-app -n $NAMESPACE
+          
+          # Verify rollback
+          kubectl rollout status deployment/laravel-deployment -n $NAMESPACE
+
+  status:
+    name: 📊 Deployment Status
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action == 'status'
+    
+    steps:
+      - name: 🔧 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: ⚙️ Setup kubectl and Helm
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+          
+          curl https://get.helm.sh/helm-v3.13.0-linux-amd64.tar.gz | tar xz
+          sudo mv linux-amd64/helm /usr/local/bin/
+
+      - name: 🔗 Configure Kubernetes Access
+        run: |
+          CLUSTER_NAME=$(aws eks list-clusters --region ${{ env.AWS_REGION }} --query 'clusters[0]' --output text)
+          aws eks update-kubeconfig --name $CLUSTER_NAME --region ${{ env.AWS_REGION }}
+
+      - name: 📊 Show Status
+        run: |
+          echo "=== CLUSTER STATUS ==="
+          kubectl get nodes
+          
+          echo "=== HELM RELEASES ==="
+          helm list -A
+          
+          echo "=== PODS STATUS ==="
+          kubectl get pods -A | grep laravel
+          
+          echo "=== SERVICES STATUS ==="
+          kubectl get svc -A | grep laravel
+          
+          echo "=== LOAD BALANCER URLs ==="
+          kubectl get svc -A -o custom-columns="NAMESPACE:.metadata.namespace,NAME:.metadata.name,TYPE:.spec.type,EXTERNAL-IP:.status.loadBalancer.ingress[0].hostname" | grep LoadBalancer

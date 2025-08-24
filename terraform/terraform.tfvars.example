@@ -1,0 +1,70 @@
+# EKS Terraform Variables Configuration
+# Copy this file to terraform.tfvars and customize as needed
+
+# ================================
+# AWS Configuration
+# ================================
+aws_region = "us-east-1"  # Change to your preferred region
+environment = "demo"
+project_name = "laravel-eks"
+
+# ================================
+# EKS Cluster Configuration
+# ================================
+cluster_name = "laravel-demo"
+cluster_version = "1.30"  # Latest stable version
+
+# ================================
+# Network Configuration
+# ================================
+vpc_cidr = "10.0.0.0/16"
+
+# ================================
+# Node Group Configuration
+# ================================
+node_group_instance_types = ["t3.medium"]  # Good balance of CPU/Memory
+node_group_desired_size = 2    # Start with 2 nodes
+node_group_max_size = 5        # Allow scaling up to 5
+node_group_min_size = 1        # Minimum 1 node
+node_group_disk_size = 20      # 20GB per node
+
+# ================================
+# Cost Optimization
+# ================================
+use_spot_instances = true       # Use spot instances for ~70% cost savings
+
+# ================================
+# Feature Flags
+# ================================
+enable_cluster_autoscaler = true
+enable_alb_controller = true
+enable_ebs_csi_driver = true
+enable_metrics_server = true
+
+# ================================
+# Optional: Domain and SSL
+# ================================
+# domain_name = "laravel-demo.your-domain.com"
+# certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/12345678-1234-1234-1234-123456789012"
+
+# ================================
+# Example configurations for different environments:
+# ================================
+
+# DEVELOPMENT (minimal cost)
+# node_group_instance_types = ["t3.small"]
+# node_group_desired_size = 1
+# node_group_max_size = 3
+# use_spot_instances = true
+
+# PRODUCTION (high availability)
+# node_group_instance_types = ["t3.large", "t3.xlarge"]
+# node_group_desired_size = 3
+# node_group_max_size = 10
+# use_spot_instances = false
+
+# DEMO (balanced)
+# node_group_instance_types = ["t3.medium"]
+# node_group_desired_size = 2
+# node_group_max_size = 5
+# use_spot_instances = true

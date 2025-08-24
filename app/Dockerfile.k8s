@@ -1,0 +1,114 @@
+# ==========================================
+# Dockerfile.k8s - Cloud-Native PHP-FPM 
+# Otimizado para Kubernetes com segurança
+# ==========================================
+
+# --- 1. Build Stage: Instala dependências do Composer ---
+FROM composer:2.6 AS vendor
+
+WORKDIR /app
+COPY composer.json ./
+# Instala dependências de produção e otimiza o autoloader
+RUN composer install --no-dev --no-interaction --no-plugins --no-scripts --prefer-dist --optimize-autoloader
+
+# --- 2. Production Stage: Cria a imagem final otimizada ---
+FROM php:8.2-fpm-alpine AS app
+
+# Argumentos para UID/GID para consistência de permissões
+ARG UID=1001
+ARG GID=1001
+
+WORKDIR /var/www/html
+
+# Instala dependências do sistema (apenas o necessário)
+RUN apk add --no-cache \
+    nginx \
+    curl \
+    libzip-dev \
+    oniguruma-dev \
+    libxml2-dev \
+    freetype-dev \
+    libjpeg-turbo-dev \
+    libpng-dev \
+    autoconf \
+    build-base \
+    linux-headers \
+    shadow
+
+# Instala extensões PHP essenciais para Laravel
+RUN docker-php-ext-configure gd --with-freetype --with-jpeg \
+    && docker-php-ext-install \
+        bcmath \
+        gd \
+        mbstring \
+        opcache \
+        pdo_mysql \
+        zip \
+        xml
+
+# Instala a extensão Redis
+RUN pecl install redis && docker-php-ext-enable redis
+
+# Cria usuário e grupo não-root
+RUN addgroup -g ${GID} -S appgroup && adduser -u ${UID} -S appuser -G appgroup
+
+# CORREÇÃO PRINCIPAL: Criar diretórios com permissões corretas para usuário não-root
+RUN mkdir -p /var/cache/nginx \
+    /var/log/nginx \
+    /var/lib/nginx/tmp \
+    /var/lib/nginx/tmp/client_body \
+    /var/lib/nginx/tmp/proxy \
+    /var/lib/nginx/tmp/fastcgi \
+    /var/lib/nginx/tmp/uwsgi \
+    /var/lib/nginx/tmp/scgi \
+    /run/nginx \
+    && chown -R appuser:appgroup /var/cache/nginx \
+    /var/log/nginx \
+    /var/lib/nginx \
+    /run/nginx \
+    && chmod -R 755 /var/cache/nginx \
+    /var/log/nginx \
+    /var/lib/nginx \
+    /run/nginx
+
+# Criar diretórios para PHP-FPM
+RUN mkdir -p /var/log/php-fpm \
+    && chown -R appuser:appgroup /var/log/php-fpm \
+    && chmod -R 755 /var/log/php-fpm
+
+# Copia configurações otimizadas para Kubernetes
+COPY docker/k8s/php.ini /usr/local/etc/php/conf.d/99-laravel.ini
+COPY docker/k8s/php-fpm.conf /usr/local/etc/php-fpm.d/www.conf
+COPY docker/k8s/nginx.conf /etc/nginx/nginx.conf
+COPY docker/k8s/default.conf /etc/nginx/http.d/default.conf
+COPY docker/k8s/start.sh /start.sh
+RUN chmod +x /start.sh
+
+# Copia dependências do Composer do primeiro estágio
+COPY --from=vendor /app/vendor ./vendor
+
+# Copia o código da aplicação Laravel
+COPY src/ .
+
+# Ajusta permissões para o usuário não-root
+RUN chown -R appuser:appgroup /var/www/html \
+    && chmod -R 755 /var/www/html
+
+# Criar links simbólicos para logs (para compatibilidade)
+RUN ln -sf /dev/stdout /var/log/nginx/access.log \
+    && ln -sf /dev/stderr /var/log/nginx/error.log
+
+# Expõe as portas
+EXPOSE 8080 9000
+
+# Muda para o usuário não-root
+USER appuser
+
+# Comando de inicialização
+CMD ["/start.sh"]
+
+# Labels para metadados
+LABEL maintainer="jorge0987" \
+      version="1.0.0" \
+      description="Laravel PHP-FPM optimized for Kubernetes" \
+      security.non-root="true"

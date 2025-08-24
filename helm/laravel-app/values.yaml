@@ -1,0 +1,139 @@
+# Default values for laravel-app
+# This is a YAML-formatted file.
+
+# Global settings
+global:
+  imageRegistry: "797805597792.dkr.ecr.us-east-1.amazonaws.com"
+  namespace: "laravel-demo"
+
+# Application configuration
+app:
+  name: laravel-app
+  version: "1.0.0"
+  environment: production
+  
+# Image configuration
+image:
+  repository: laravel-swoole-poc/laravel-fpm
+  tag: "k8s-v1.1.0"
+  pullPolicy: Always
+
+# PHP-FPM specific configuration
+phpfpm:
+  enabled: true
+  replicaCount: 2
+  
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 250m
+      memory: 256Mi
+
+  # PHP-FPM pool configuration
+  config:
+    pm: "dynamic"
+    pm_max_children: 50
+    pm_start_servers: 5
+    pm_min_spare_servers: 5
+    pm_max_spare_servers: 35
+    pm_max_requests: 500
+
+# Swoole configuration (optional)
+swoole:
+  enabled: false
+  replicaCount: 1
+  
+  resources:
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+    requests:
+      cpu: 500m
+      memory: 512Mi
+
+# Service configuration (LoadBalancer Internet-Facing)
+service:
+  type: LoadBalancer
+  port: 80
+  targetPort: 8080
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+
+# Ingress configuration (DESABILITADO para teste inicial)
+ingress:
+  enabled: false
+  className: "alb"
+
+# Horizontal Pod Autoscaler
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+# Health checks
+healthcheck:
+  enabled: true
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: 8080
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readinessProbe:
+    httpGet:
+      path: /ready
+      port: 8080
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+# Security context (Pod level)
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1001
+  runAsGroup: 1001
+  fsGroup: 1001
+
+# Container security context  
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop:
+    - ALL
+
+# Pod annotations
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "9000"
+  prometheus.io/path: "/metrics"
+
+# Node selection
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Service Account
+serviceAccount:
+  create: true
+  annotations:
+    eks.amazonaws.com/role-arn: "arn:aws:iam::797805597792:role/laravel-swoole-poc-laravel-app"
+  name: "laravel-app-sa"
+
+# Monitoring
+monitoring:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+    labels:
+      app: laravel-app
+    interval: 30s
+    path: /metrics

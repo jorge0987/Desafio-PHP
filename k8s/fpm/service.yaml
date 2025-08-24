@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: laravel-fpm-service
+  namespace: laravel-demo
+  labels:
+    app: laravel-fpm
+    service: laravel-fpm
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    targetPort: 80
+    protocol: TCP
+    name: http
+  selector:
+    app: laravel-fpm
+---

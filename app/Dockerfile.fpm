@@ -1,0 +1,82 @@
+# ==========================================
+# Dockerfile.fpm - PHP-FPM Optimized
+# ==========================================
+ 
+ # --- 1. Build Stage: Instala dependências do Composer ---
+ FROM composer:2.6 AS vendor
+ 
+ WORKDIR /app
+ COPY composer.json ./
+ # Instala dependências de produção e otimiza o autoloader
+ RUN composer install --no-dev --no-interaction --no-plugins --no-scripts --prefer-dist --optimize-autoloader
+ 
+ # --- 2. Production Stage: Cria a imagem final otimizada ---
+ FROM php:8.2-fpm-alpine AS app
+ 
+ # Argumentos para UID/GID para consistência de permissões
+ ARG UID=1001
+ ARG GID=1001
+ 
+ WORKDIR /var/www/html
+ 
+ # Instala dependências do sistema (apenas o necessário)
+ RUN apk add --no-cache \
+     nginx \
+     curl \
+     libzip-dev \
+     oniguruma-dev \
+     libxml2-dev \
+     freetype-dev \
+     libjpeg-turbo-dev \
+     libpng-dev \
+     autoconf \
+     build-base \
+     linux-headers
+ 
+ # Instala extensões PHP essenciais para Laravel
+ RUN docker-php-ext-configure gd --with-freetype --with-jpeg \
+     && docker-php-ext-install \
+         bcmath \
+         gd \
+         mbstring \
+         opcache \
+         pdo_mysql \
+         zip \
+         xml
+ 
+ # Instala a extensão Redis
+ RUN pecl install redis && docker-php-ext-enable redis
+ 
+ # Cria usuário e grupo não-root
+ RUN addgroup -g ${GID} -S appgroup && adduser -u ${UID} -S appuser -G appgroup
+ 
+ # Copia configurações otimizadas
+ COPY docker/php.ini /usr/local/etc/php/conf.d/99-laravel.ini
+ COPY docker/php-fpm.conf /usr/local/etc/php-fpm.d/www.conf
+ COPY docker/nginx.conf /etc/nginx/nginx.conf
+ COPY docker/default.conf /etc/nginx/http.d/default.conf
+ COPY docker/start.sh /start.sh
+ RUN chmod +x /start.sh
+ 
+ # Copia dependências do Composer do primeiro estágio
+ COPY --from=vendor /app/vendor ./vendor
+ 
+# Copia o código da aplicação Laravel
+COPY src/ .
+
+# Nota: Esta é uma aplicação Laravel simplificada sem artisan
+# Para produção real, descomente as linhas abaixo se tiver artisan:
+# RUN php artisan config:cache \
+#     && php artisan route:cache \
+#     && php artisan view:cache # Ajusta permissões para o usuário não-root
+ RUN chown -R appuser:appgroup /var/www/html \
+     && chmod -R 775 /var/www/html/storage /var/www/html/bootstrap/cache
+ 
+ # Expõe as portas
+ EXPOSE 80 9000
+ 
+ # Muda para o usuário não-root
+ USER appuser
+ 
+ # Comando de inicialização
+ CMD ["/start.sh"]
