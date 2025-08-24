@@ -50,3 +50,6 @@ kubeconfig
 # K6 results
 benchmarks/results/*.json
 !benchmarks/results/.gitkeep
+
+# Interview materials (keep local only)
+INTERVIEW-HIGHLIGHTS.md

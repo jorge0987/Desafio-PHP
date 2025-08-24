@@ -187,8 +187,8 @@ aws configure  # Configure AWS credentials
 ### **1. Deploy Infrastructure**
 ```bash
 # Clone and navigate
-git clone <repository>
-cd Desafio-php/terraform
+git clone git@github.com:jorge0987/Desafio-PHP.git
+cd Desafio-PHP/terraform
 
 # Deploy ARM64 EKS cluster (takes ~15 minutes)
 terraform init
@@ -391,7 +391,7 @@ terraform show | grep -E "(running|active)"
 ## 🗂️ **Project Structure**
 
 ```
-Desafio-php/
+Desafio-PHP/
 ├── app/                      # Laravel application
 │   ├── Dockerfile.fpm        # PHP-FPM container build
 │   ├── Dockerfile.swoole     # Swoole container build  
